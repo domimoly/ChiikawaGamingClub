@@ -218,20 +218,41 @@ _BASE_RAW = """
       line-height: 1.55;
     }
     h1, h2 { font-family: 'Fredoka', 'Nunito', sans-serif; font-weight: 600; }
-    h1 {
-      color: var(--ink);
-      text-align: center;
-      font-size: 2.3em;
-      line-height: 1.1;
-      margin: 0 0 6px;
-    }
     h2 { font-size: 1.35em; margin: 0 0 8px; line-height: 1.2; }
     p { margin: 0 0 10px; }
-    .subtitle {
-      text-align: center;
-      color: var(--ink-soft);
-      margin: 0 0 18px;
+    /* Encabezado */
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      margin: 0 0 20px;
     }
+    .top-art { position: relative; flex: none; width: 104px; height: 104px; }
+    .top-art .top-av { width: 104px; height: 104px; }
+    .top-art .pad { position: absolute; width: 56px; right: -16px; bottom: -2px; }
+    .top-text { min-width: 0; }
+    h1 {
+      color: var(--ink);
+      font-size: 2.5em;
+      line-height: 1.05;
+      margin: 0 0 8px;
+    }
+    .sello {
+      display: inline-block;
+      background: var(--pink);
+      color: #fff;
+      font-size: .42em;
+      line-height: 1;
+      padding: 7px 14px;
+      border: 2px solid var(--ink);
+      border-radius: 999px;
+      box-shadow: 0 3px 0 var(--ink);
+      vertical-align: middle;
+      transform: rotate(-3deg);
+      margin-left: 4px;
+    }
+    .subtitle { color: var(--ink-soft); margin: 0; max-width: 34ch; }
 
     /* Navegación */
     nav {
@@ -426,6 +447,29 @@ _BASE_RAW = """
     .vacio { text-align: center; padding: 8px 0 2px; }
     .vacio .av { margin: 0 auto 6px; display: block; }
 
+    /* Juego de parejas */
+    .memo-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .memo-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+    .carta {
+      aspect-ratio: 1;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--lav);
+      color: var(--ink);
+      border-radius: 16px;
+      font-family: 'Fredoka', 'Nunito', sans-serif;
+      font-size: 1.8em;
+    }
+    .carta .cara-frente { display: none; width: 100%; height: 100%; align-items: center; justify-content: center; }
+    .carta .av { width: 70%; height: 70%; }
+    .carta.abierta, .carta.lista { background: #fff; }
+    .carta.abierta .cara-frente, .carta.lista .cara-frente { display: flex; }
+    .carta.abierta .cara-atras, .carta.lista .cara-atras { display: none; }
+    .carta.lista { background: var(--butter); box-shadow: none; transform: translateY(3px); cursor: default; }
+    .memo-fin { min-height: 3.2em; margin: 0; }
+
     /* Perfil */
     .carnet { display: flex; align-items: center; gap: 18px; }
     .carnet h2 { margin-bottom: 4px; }
@@ -453,7 +497,12 @@ _BASE_RAW = """
     .tile input:focus-visible + .tile-body { outline: 3px solid var(--ink); outline-offset: 3px; }
 
     @media (max-width: 540px) {
-      h1 { font-size: 1.9em; }
+      .top { gap: 22px; }
+      .top-art { width: 76px; height: 76px; }
+      .top-art .top-av { width: 76px; height: 76px; }
+      .top-art .pad { width: 42px; right: -12px; }
+      h1 { font-size: 1.8em; }
+      .sello { display: table; margin: 6px 0 0; }
       .hero { flex-direction: column-reverse; align-items: flex-start; }
       .tiles { grid-template-columns: 1fr; }
       .tile-body { flex-direction: row; text-align: left; gap: 12px; padding: 10px 12px; }
@@ -541,11 +590,26 @@ _BASE_RAW = """
     </defs>
   </svg>
 
-  <h1>Chiikawa Gaming Club</h1>
-  <p class="subtitle">pequeño, débil, un poco torpe... pero gamer</p>
+  <header class="top">
+    <div class="top-art" aria-hidden="true">
+      <svg class="av top-av" viewBox="0 0 100 100"><use href="#a-chii"/></svg>
+      <svg class="pad" viewBox="0 0 64 36">
+        <rect x="2" y="3" width="60" height="28" rx="14" fill="#bfe6fa" stroke="#4b3a44" stroke-width="3"/>
+        <rect x="17" y="10" width="4" height="14" rx="1" fill="#4b3a44"/>
+        <rect x="12" y="15" width="14" height="4" rx="1" fill="#4b3a44"/>
+        <circle cx="43" cy="14" r="3.2" fill="#d9487a"/>
+        <circle cx="50" cy="20" r="3.2" fill="#d9487a"/>
+      </svg>
+    </div>
+    <div class="top-text">
+      <h1>Chiikawa <span class="sello">Gaming Club</span></h1>
+      <p class="subtitle">Un club chiquito para jugar, charlar y aprender cosas de Chiikawa.</p>
+    </div>
+  </header>
   <nav>
     <a href="/">Inicio</a>
     <a href="/muro">Muro</a>
+    <a href="/juego">Juego</a>
     <a href="/perfil">Mi perfil</a>
     <a href="/logout">Salir</a>
   </nav>
@@ -593,12 +657,16 @@ def home():
         texto = "Elige tu equipo, deja un mensaje en el muro y descubre cosas que quizá no sabías de Chiikawa."
         botones = (
             f'<a class="btn" href="{url_for("muro")}">Ir al muro</a>'
+            f'<a class="btn alt" href="{url_for("juego")}">Jugar</a>'
             f'<a class="btn alt" href="{url_for("perfil")}">Ver mi perfil</a>'
         )
     else:
         titulo = "Entra al club"
         texto = "Un club para jugar, charlar y aprender sobre Chiikawa. Inicia sesión para escribir en el muro y elegir equipo."
-        botones = f'<a class="btn" href="{url_for("login")}">Iniciar sesión</a>'
+        botones = (
+            f'<a class="btn" href="{url_for("login")}">Iniciar sesión</a>'
+            f'<a class="btn alt" href="{url_for("juego")}">Jugar</a>'
+        )
 
     filas = "".join(
         f"<li>{avatar(clave)}<div><b>{nombre_p}</b><p>{desc}</p></div></li>"
@@ -625,6 +693,100 @@ def home():
     </section>
     """
     return BASE.format(content=content)
+
+
+# ---------- Juego: parejas de Chiikawa (todo en el navegador, sin servidor) ----------
+
+JUEGO_HTML = """
+<section class="card butter">
+  <h2>Parejas Chiikawa</h2>
+  <p>Da vuelta las cartas y encuentra las 4 parejas con la menor cantidad de intentos.</p>
+  <div class="memo-bar">
+    <span>Intentos: <b id="memo-intentos">0</b></span>
+    <button type="button" class="ghost" id="memo-reiniciar">Reiniciar</button>
+  </div>
+  <div class="memo-grid" id="memo-grid"></div>
+  <p class="memo-fin" id="memo-fin" role="status"></p>
+</section>
+<script>
+(function () {
+  var claves = ['chii', 'hachi', 'usagi', 'momo'];
+  var nombres = {chii: 'Chiikawa', hachi: 'Hachiware', usagi: 'Usagi', momo: 'Momonga'};
+  var datos = {
+    chii: 'Chiikawa se asusta y llora con facilidad, pero igual se esfuerza.',
+    hachi: 'Hachiware es el que más habla de los tres amigos.',
+    usagi: 'Usagi grita cosas como «ura» y «yaha».',
+    momo: 'Momonga es una ardilla voladora que actúa lindo.'
+  };
+  var grid = document.getElementById('memo-grid');
+  var intEl = document.getElementById('memo-intentos');
+  var msg = document.getElementById('memo-fin');
+  var abiertas, bloqueo, intentos, parejas;
+
+  function mezclar(a) {
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  function iniciar() {
+    grid.innerHTML = '';
+    abiertas = []; bloqueo = false; intentos = 0; parejas = 0;
+    intEl.textContent = '0';
+    msg.textContent = '';
+    mezclar(claves.concat(claves)).forEach(function (k) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'carta';
+      b.setAttribute('data-k', k);
+      b.setAttribute('aria-label', 'Carta boca abajo');
+      b.innerHTML = '<span class="cara-atras">?</span><span class="cara-frente"><svg class="av" viewBox="0 0 100 100" aria-hidden="true"><use href="#a-' + k + '"/></svg></span>';
+      b.addEventListener('click', function () { voltear(b); });
+      grid.appendChild(b);
+    });
+  }
+
+  function voltear(b) {
+    if (bloqueo || b.classList.contains('abierta') || b.classList.contains('lista')) { return; }
+    b.classList.add('abierta');
+    b.setAttribute('aria-label', nombres[b.getAttribute('data-k')]);
+    abiertas.push(b);
+    if (abiertas.length < 2) { return; }
+    intentos++;
+    intEl.textContent = intentos;
+    var a = abiertas[0], c = abiertas[1];
+    var k = a.getAttribute('data-k');
+    if (k === c.getAttribute('data-k')) {
+      a.classList.add('lista'); c.classList.add('lista');
+      abiertas = [];
+      parejas++;
+      msg.textContent = datos[k];
+      if (parejas === claves.length) {
+        msg.textContent = '¡Las encontraste todas en ' + intentos + ' intentos! ' + datos[k];
+      }
+    } else {
+      bloqueo = true;
+      setTimeout(function () {
+        a.classList.remove('abierta'); c.classList.remove('abierta');
+        a.setAttribute('aria-label', 'Carta boca abajo');
+        c.setAttribute('aria-label', 'Carta boca abajo');
+        abiertas = []; bloqueo = false;
+      }, 800);
+    }
+  }
+
+  document.getElementById('memo-reiniciar').addEventListener('click', iniciar);
+  iniciar();
+})();
+</script>
+"""
+
+
+@app.route("/juego")
+def juego():
+    return BASE.format(content=JUEGO_HTML)
 
 
 # === PUNTO DE ENTRADA 1: LOGIN (vulnerable a SQL Injection) ===
