@@ -1,6 +1,6 @@
 # Chiikawa Gaming Club 🐾
 
-Mini aplicación web en **Flask** creada para la **Evaluación Parcial 2 de Ciberseguridad (EA 2 · OCY1102)**.
+Mini aplicación web en **Flask** creada para la **Evaluación Parcial 2 de Ciberseguridad (EA 2 · OCY1102) | Dominga Ruiz**.
 
 Es un club de juegos con tema Chiikawa (login, muro de mensajes, perfil y selección de club) que **partió con
 vulnerabilidades intencionales** (SQL Injection, XSS almacenado, CSRF y ausencia de segundo factor). Todas fueron
