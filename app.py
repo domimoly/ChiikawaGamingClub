@@ -13,21 +13,57 @@ Puntos de entrada de datos (3), cada uno con una falla distinta:
   3. /unirse-club        -> CSRF (cambia el club del jugador, sin token, solo con la cookie de sesión)
 
 Además, la autenticación NO tiene segundo factor (falta IL 2.3 / MFA).
+
+ESTADO ACTUAL: todas las fallas anteriores fueron corregidas:
+  1. /login          -> consulta parametrizada + validación de formato + contraseñas con hash
+                        + bloqueo temporal por intentos fallidos
+  2. /muro           -> salida escapada (XSS) + validación de largo/caracteres + token CSRF
+  3. /unirse-club    -> token CSRF + lista blanca de clubes
+  +  MFA (TOTP, RFC 6238) obligatorio después de la contraseña
+  +  cabeceras de seguridad (CSP con nonce, X-Frame-Options, etc.), cookies endurecidas
 """
 
-from flask import Flask, request, redirect, url_for, session, g
+from flask import Flask, request, redirect, url_for, session, g, abort
 from markupsafe import escape
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import date
+from functools import wraps
+from urllib.parse import urlsplit
+import base64
+import hashlib
+import hmac
 import html
 import json
+import re
+import secrets
 import sqlite3
+import struct
 import os
+import time
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "chiikawa.db")
 
 app = Flask(__name__)
-app.secret_key = "clave-super-secreta-cambiar"  # ok para práctica local
+# La clave de sesión NO va en el código: se lee del entorno. Si no existe, se genera
+# una aleatoria por ejecución (las sesiones se invalidan al reiniciar, lo cual es seguro).
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,          # el JS de la página no puede leer la cookie
+    SESSION_COOKIE_SAMESITE="Lax",         # el navegador no envía la cookie en POST entre sitios
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1",  # activar con HTTPS
+    PERMANENT_SESSION_LIFETIME=1800,       # 30 min
+    MAX_CONTENT_LENGTH=16 * 1024,          # rechaza cuerpos POST gigantes
+)
+
+# --- Reglas de validación (lista blanca) ---
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+MAX_PASSWORD = 128
+MAX_MENSAJE = 280
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # conserva \t y \n
+MFA_CODE_RE = re.compile(r"^\d{6}$")
+MAX_INTENTOS = 5          # intentos fallidos antes de bloquear
+BLOQUEO_SEG = 300         # 5 minutos
 
 
 # ---------- Base de datos ----------
@@ -54,27 +90,175 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            club TEXT NOT NULL DEFAULT 'Sin club'
+            club TEXT NOT NULL DEFAULT 'Sin club',
+            totp_secret TEXT,
+            totp_ultimo INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Migración: columnas de MFA en bases creadas antes de agregar el segundo factor.
+    cols_j = [fila[1] for fila in db.execute("PRAGMA table_info(jugadores)")]
+    if "totp_secret" not in cols_j:
+        db.execute("ALTER TABLE jugadores ADD COLUMN totp_secret TEXT")
+    if "totp_ultimo" not in cols_j:
+        db.execute("ALTER TABLE jugadores ADD COLUMN totp_ultimo INTEGER NOT NULL DEFAULT 0")
+    # Migración: las contraseñas en texto plano pasan a hash (scrypt con sal, vía Werkzeug).
+    for fila in db.execute("SELECT id, password FROM jugadores").fetchall():
+        if not fila[1].startswith(("scrypt:", "pbkdf2:")):
+            db.execute("UPDATE jugadores SET password = ? WHERE id = ?",
+                       (generate_password_hash(fila[1]), fila[0]))
+    db.commit()
     db.execute("""
         CREATE TABLE IF NOT EXISTS mensajes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             autor TEXT NOT NULL,
-            contenido TEXT NOT NULL
+            contenido TEXT NOT NULL,
+            club TEXT
         )
     """)
+    # Migración: bases creadas antes de que el muro guardara el equipo del mensaje.
+    columnas = [fila[1] for fila in db.execute("PRAGMA table_info(mensajes)")]
+    if "club" not in columnas:
+        db.execute("ALTER TABLE mensajes ADD COLUMN club TEXT")
+    db.execute(
+        "UPDATE mensajes SET club = "
+        "(SELECT club FROM jugadores WHERE jugadores.username = mensajes.autor) "
+        "WHERE club IS NULL"
+    )
+    db.commit()
     if first_time:
         db.executemany(
             "INSERT INTO jugadores (username, password, club) VALUES (?, ?, ?)",
             [
-                ("chiikawa", "sakura123", "Equipo Usagi"),
-                ("hachiware", "estrella99", "Equipo Momonga"),
-                ("usagi", "zanahoria1", "Equipo Usagi"),
+                ("chiikawa", generate_password_hash("sakura123"), "Equipo Usagi"),
+                ("hachiware", generate_password_hash("estrella99"), "Equipo Momonga"),
+                ("usagi", generate_password_hash("zanahoria1"), "Equipo Usagi"),
             ],
         )
         db.commit()
     db.close()
+
+
+# =====================================================================
+#  SEGURIDAD: CSRF, cabeceras, límite de intentos, MFA (TOTP)
+# =====================================================================
+
+# ---------- CSRF ----------
+# Cada sesión tiene un token aleatorio. Todo POST debe traerlo en el campo oculto
+# "csrf_token"; un sitio externo no puede leerlo (política same-origin), así que
+# no puede fabricar un POST válido aunque el navegador envíe la cookie de sesión.
+
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+
+def csrf_field():
+    return f'<input type="hidden" name="csrf_token" value="{csrf_token()}">'
+
+
+@app.before_request
+def proteger_csrf():
+    g.nonce = secrets.token_urlsafe(16)  # nonce de CSP para esta respuesta
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        # Defensa en profundidad: si el navegador manda Origin, debe ser este mismo sitio.
+        origen = request.headers.get("Origin")
+        if origen and origen != "null" and urlsplit(origen).netloc != request.host:
+            abort(403, "Origen no permitido.")
+        if origen == "null":
+            abort(403, "Origen no permitido.")
+        enviado = request.form.get("csrf_token", "").encode("utf-8")
+        esperado = session.get("csrf", "").encode("utf-8")
+        if not esperado or not hmac.compare_digest(enviado, esperado):
+            abort(400, "Token CSRF inválido o ausente. Recarga la página e inténtalo de nuevo.")
+
+
+# ---------- Cabeceras de seguridad ----------
+
+@app.after_request
+def cabeceras_seguridad(resp):
+    nonce = g.get("nonce", "")
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"script-src 'nonce-{nonce}'; "              # solo scripts con el nonce de esta respuesta
+        f"style-src 'nonce-{nonce}' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; "
+        "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'"
+    )
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "same-origin"  # "no-referrer" haría que Chrome envíe Origin: null también en formularios propios
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------- Límite de intentos (fuerza bruta) ----------
+# En memoria: suficiente para esta app local. En producción iría en Redis/BD.
+
+_intentos = {}  # clave -> [fallos, bloqueado_hasta]
+
+
+def esta_bloqueado(clave):
+    reg = _intentos.get(clave)
+    return bool(reg and reg[1] > time.time())
+
+
+def registrar_fallo(clave):
+    reg = _intentos.setdefault(clave, [0, 0.0])
+    if reg[1] and reg[1] <= time.time():   # el bloqueo anterior ya venció
+        reg[0], reg[1] = 0, 0.0
+    reg[0] += 1
+    if reg[0] >= MAX_INTENTOS:
+        reg[1] = time.time() + BLOQUEO_SEG
+
+
+def limpiar_intentos(clave):
+    _intentos.pop(clave, None)
+
+
+# ---------- MFA: TOTP (RFC 6238) con la librería estándar ----------
+
+def nuevo_secreto_totp():
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii")  # 160 bits, 32 caracteres
+
+
+def totp(secreto, paso=None):
+    """Código de 6 dígitos para un paso de 30 s (compatible con Google/Microsoft Authenticator)."""
+    paso = int(time.time() // 30) if paso is None else paso
+    clave = base64.b32decode(secreto + "=" * (-len(secreto) % 8))
+    mac = hmac.new(clave, struct.pack(">Q", paso), hashlib.sha1).digest()
+    i = mac[-1] & 0x0F
+    numero = (struct.unpack(">I", mac[i:i + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{numero:06d}"
+
+
+def verificar_totp(secreto, codigo, ultimo_paso):
+    """Devuelve el paso aceptado o None. Tolera ±1 paso de desfase de reloj y rechaza
+    reutilizar un código ya usado (anti-replay: el paso debe ser mayor al último aceptado)."""
+    actual = int(time.time() // 30)
+    for paso in (actual - 1, actual, actual + 1):
+        if paso > ultimo_paso and hmac.compare_digest(totp(secreto, paso), codigo):
+            return paso
+    return None
+
+
+def login_required(vista):
+    """Solo deja pasar a sesiones que completaron contraseña Y segundo factor."""
+    @wraps(vista)
+    def envoltura(*args, **kwargs):
+        if not session.get("username"):
+            return redirect(url_for("login"))
+        return vista(*args, **kwargs)
+    return envoltura
+
+
+# ---------- Validación y sanitización de entradas ----------
+
+def limpiar_texto(valor):
+    """Normaliza un texto libre: quita caracteres de control y espacios sobrantes.
+    (La defensa contra XSS es ESCAPAR al mostrar, no solo limpiar aquí.)"""
+    return CONTROL_CHARS_RE.sub("", str(valor)).strip()
 
 
 # =====================================================================
@@ -194,7 +378,7 @@ _BASE_RAW = """
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600&family=Nunito:wght@400;700;800&display=swap" rel="stylesheet">
-  <style>
+  <style nonce="__NONCE__">
     :root {
       --ink: #4b3a44;
       --ink-soft: #7d6873;
@@ -207,6 +391,8 @@ _BASE_RAW = """
       --paper: #fffdfb;
     }
     * { box-sizing: border-box; }
+    .sprite { position: absolute; }
+    code { font-size: 1.15em; letter-spacing: .06em; background: var(--lav); padding: 3px 10px; border-radius: 8px; display: inline-block; }
     body {
       font-family: 'Nunito', system-ui, sans-serif;
       color: var(--ink);
@@ -274,6 +460,16 @@ _BASE_RAW = """
       box-shadow: 0 3px 0 rgba(75, 58, 68, .25);
     }
     nav a:hover { background: var(--blush); }
+    .logout-form { margin: 0; display: inline; }
+    nav .navbtn {
+      background: var(--paper);
+      color: var(--ink);
+      padding: 8px 16px;
+      font-size: .95em;
+      line-height: 1.55;
+      box-shadow: 0 3px 0 rgba(75, 58, 68, .25);
+    }
+    nav .navbtn:hover { background: var(--blush); }
     nav a[aria-current="page"] { background: var(--butter); }
 
     /* Tarjetas */
@@ -444,6 +640,8 @@ _BASE_RAW = """
     .msg-card .av { width: 44px; height: 44px; }
     .msg-body { min-width: 0; padding-top: 2px; }
     .msg-body b { font-family: 'Fredoka', 'Nunito', sans-serif; font-weight: 600; }
+    .msg-body .chip { margin: 0 0 0 4px; padding: 1px 10px; font-size: .75em; background: rgba(255, 255, 255, .7); }
+    .composer select { margin-bottom: 12px; }
     .vacio { text-align: center; padding: 8px 0 2px; }
     .vacio .av { margin: 0 auto 6px; display: block; }
 
@@ -515,7 +713,7 @@ _BASE_RAW = """
   </style>
 </head>
 <body>
-  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
     <defs>
       <!-- Chiikawa -->
       <symbol id="a-chii" viewBox="0 0 100 100">
@@ -611,11 +809,14 @@ _BASE_RAW = """
     <a href="/muro">Muro</a>
     <a href="/juego">Juego</a>
     <a href="/perfil">Mi perfil</a>
-    <a href="/logout">Salir</a>
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="__CSRF__">
+      <button type="submit" class="navbtn">Salir</button>
+    </form>
   </nav>
   {content}
 
-  <script>
+  <script nonce="__NONCE__">
     (function () {
       var path = location.pathname.replace(/\\/$/, '') || '/';
       document.querySelectorAll('nav a').forEach(function (a) {
@@ -645,6 +846,24 @@ _BASE_RAW = """
 """
 
 BASE = _BASE_RAW.replace("{", "{{").replace("}", "}}").replace("{{content}}", "{content}")
+
+
+def page(content):
+    """Renderiza la plantilla. El nonce y el token CSRF se insertan en la PLANTILLA (texto
+    fijo) antes de incorporar el contenido, así nada que venga del usuario puede alterarlos."""
+    return (BASE.replace("__NONCE__", g.nonce)
+                .replace("__CSRF__", csrf_token())
+                .format(content=content))
+
+
+@app.errorhandler(400)
+@app.errorhandler(403)
+@app.errorhandler(413)
+def error_seguridad(e):
+    msg = escape(getattr(e, "description", "Solicitud no válida."))
+    cuerpo = f'<div class="card"><h2>No se pudo completar</h2><p class="error">⚠️ {msg}</p>' \
+             f'<div class="actions"><a class="btn alt" href="/">Volver al inicio</a></div></div>'
+    return page(cuerpo), e.code
 
 
 # ---------- Rutas ----------
@@ -692,7 +911,7 @@ def home():
       <ul class="cast">{filas}</ul>
     </section>
     """
-    return BASE.format(content=content)
+    return page(content)
 
 
 # ---------- Juego: parejas de Chiikawa (todo en el navegador, sin servidor) ----------
@@ -708,7 +927,7 @@ JUEGO_HTML = """
   <div class="memo-grid" id="memo-grid"></div>
   <p class="memo-fin" id="memo-fin" role="status"></p>
 </section>
-<script>
+<script nonce="__NONCE__">
 (function () {
   var claves = ['chii', 'hachi', 'usagi', 'momo'];
   var nombres = {chii: 'Chiikawa', hachi: 'Hachiware', usagi: 'Usagi', momo: 'Momonga'};
@@ -786,77 +1005,239 @@ JUEGO_HTML = """
 
 @app.route("/juego")
 def juego():
-    return BASE.format(content=JUEGO_HTML)
+    return page(JUEGO_HTML.replace("__NONCE__", g.nonce))
 
 
-# === PUNTO DE ENTRADA 1: LOGIN (vulnerable a SQL Injection) ===
+# === PUNTO DE ENTRADA 1: LOGIN (SQLi corregida + validación + hash + límite de intentos) ===
+HASH_FALSO = generate_password_hash("contraseña-que-no-existe")  # iguala tiempos si el usuario no existe
+
+MSG_LOGIN_MALO = "Usuario o contraseña incorrectos."  # mismo mensaje siempre: no revela qué falló
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "")
+        username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        clave = f"login|{request.remote_addr}|{username.lower()}"
 
-        # --- CORREGIDO: consulta parametrizada (prepared statement).
-        #     El username y password SIEMPRE se tratan como datos, nunca
-        #     como parte del código SQL, sin importar qué caracteres traigan. ---
-        db = get_db()
-        query = "SELECT * FROM jugadores WHERE username = ? AND password = ?"
-        cur = db.execute(query, (username, password))
-        user = cur.fetchone()
-        # -----------------------------------------------------------------
-
-        if user:
-            session["username"] = user["username"]
-            # NOTA: no hay segundo factor aquí (falta MFA)
-            return redirect(url_for("perfil"))
+        if esta_bloqueado(clave):
+            error = "Demasiados intentos fallidos. Espera unos minutos e inténtalo de nuevo."
+        elif not USERNAME_RE.fullmatch(username) or not password or len(password) > MAX_PASSWORD:
+            # Formato inválido: ni siquiera se consulta la base de datos.
+            registrar_fallo(clave)
+            error = MSG_LOGIN_MALO
         else:
-            error = "Usuario o contraseña incorrectos."
+            # Consulta parametrizada: username viaja como DATO, nunca como código SQL.
+            user = get_db().execute(
+                "SELECT * FROM jugadores WHERE username = ?", (username,)
+            ).fetchone()
+            # Siempre se calcula un hash (aunque el usuario no exista) para no filtrar por tiempo.
+            clave_ok = check_password_hash(user["password"] if user else HASH_FALSO, password)
+            if user and clave_ok:
+                limpiar_intentos(clave)
+                session.clear()  # nueva sesión: evita fijación de sesión
+                # Contraseña correcta, pero todavía NO hay sesión: falta el segundo factor.
+                session["pendiente"] = user["username"]
+                session["pendiente_hasta"] = time.time() + 300
+                return redirect(url_for("mfa"))
+            registrar_fallo(clave)
+            error = MSG_LOGIN_MALO
 
-    form = """
+    form = f"""
     <div class="card">
       <h2>(｡•ᴗ•｡) Iniciar sesión</h2>
       <form method="post">
-        <label>Usuario</label>
-        <input type="text" name="username" placeholder="ej: chiikawa">
-        <label>Contraseña</label>
-        <input type="password" name="password" placeholder="••••••••">
+        {csrf_field()}
+        <label for="username">Usuario</label>
+        <input type="text" id="username" name="username" placeholder="ej: chiikawa"
+               maxlength="32" autocomplete="username" required>
+        <label for="password">Contraseña</label>
+        <input type="password" id="password" name="password" placeholder="••••••••"
+               maxlength="{MAX_PASSWORD}" autocomplete="current-password" required>
         <button type="submit">Entrar 🎮</button>
       </form>
-      {error}
-      <p class="hint">Prueba: chiikawa / sakura123</p>
+      {f"<p class='error'>⚠️ {escape(error)}</p>" if error else ""}
+      <p class="hint">Prueba: chiikawa / sakura123 (después te pedirá el código MFA)</p>
     </div>
-    """.format(error=f"<p class='error'>⚠️ {error}</p>" if error else "")
-    return BASE.format(content=form)
+    """
+    return page(form)
 
 
-# === PUNTO DE ENTRADA 2: MURO DE MENSAJES (vulnerable a XSS almacenado) ===
-@app.route("/muro", methods=["GET", "POST"])
-def muro():
-    if "username" not in session:
+# === SEGUNDO FACTOR (MFA / TOTP) ===
+# Etapa 2 del login. Sin esta etapa no existe session["username"], por lo que NINGUNA
+# ruta protegida (@login_required: /muro, /perfil, /unirse-club) es accesible.
+
+def _usuario_pendiente():
+    nombre = session.get("pendiente")
+    if not nombre or session.get("pendiente_hasta", 0) < time.time():
+        session.pop("pendiente", None)
+        return None
+    return get_db().execute("SELECT * FROM jugadores WHERE username = ?", (nombre,)).fetchone()
+
+
+def _completar_login(nombre):
+    session.clear()
+    session["username"] = nombre
+    session.permanent = True
+
+
+@app.route("/mfa", methods=["GET", "POST"])
+def mfa():
+    user = _usuario_pendiente()
+    if user is None:
         return redirect(url_for("login"))
+    if not user["totp_secret"]:
+        return redirect(url_for("mfa_activar"))  # primera vez: hay que enrolar el autenticador
 
-    db = get_db()
+    error = None
     if request.method == "POST":
-        contenido = request.form.get("contenido", "")
-        db.execute(
-            "INSERT INTO mensajes (autor, contenido) VALUES (?, ?)",
-            (session["username"], contenido),
-        )
-        db.commit()
+        codigo = request.form.get("codigo", "").replace(" ", "")
+        clave = f"mfa|{request.remote_addr}|{user['username']}"
+        if esta_bloqueado(clave):
+            error = "Demasiados intentos fallidos. Espera unos minutos."
+        elif not MFA_CODE_RE.fullmatch(codigo):
+            registrar_fallo(clave)
+            error = "El código debe tener 6 dígitos."
+        else:
+            paso = verificar_totp(user["totp_secret"], codigo, user["totp_ultimo"])
+            if paso is not None:
+                db = get_db()
+                db.execute("UPDATE jugadores SET totp_ultimo = ? WHERE id = ?", (paso, user["id"]))
+                db.commit()
+                limpiar_intentos(clave)
+                _completar_login(user["username"])
+                return redirect(url_for("perfil"))
+            registrar_fallo(clave)
+            error = "Código incorrecto o ya usado."
+
+    form = f"""
+    <div class="card">
+      <h2>Verificación en dos pasos</h2>
+      <p>Hola, <b>{escape(user['username'])}</b>. Escribe el código de 6 dígitos de tu app autenticadora.</p>
+      <form method="post">
+        {csrf_field()}
+        <label for="codigo">Código</label>
+        <input type="text" id="codigo" name="codigo" inputmode="numeric" pattern="[0-9 ]{{6,7}}"
+               maxlength="7" autocomplete="one-time-code" autofocus required>
+        <button type="submit">Verificar</button>
+      </form>
+      {f"<p class='error'>⚠️ {escape(error)}</p>" if error else ""}
+    </div>
+    """
+    return page(form)
+
+
+@app.route("/mfa/activar", methods=["GET", "POST"])
+def mfa_activar():
+    user = _usuario_pendiente()
+    if user is None:
+        return redirect(url_for("login"))
+    if user["totp_secret"]:
+        return redirect(url_for("mfa"))  # ya tiene MFA: no se puede volver a enrolar
+
+    secreto = session.get("totp_nuevo")
+    if not secreto:
+        secreto = session["totp_nuevo"] = nuevo_secreto_totp()
+
+    error = None
+    if request.method == "POST":
+        codigo = request.form.get("codigo", "").replace(" ", "")
+        clave = f"mfa|{request.remote_addr}|{user['username']}"
+        if esta_bloqueado(clave):
+            error = "Demasiados intentos fallidos. Espera unos minutos."
+        elif not MFA_CODE_RE.fullmatch(codigo):
+            registrar_fallo(clave)
+            error = "El código debe tener 6 dígitos."
+        else:
+            paso = verificar_totp(secreto, codigo, 0)
+            if paso is not None:
+                db = get_db()
+                db.execute("UPDATE jugadores SET totp_secret = ?, totp_ultimo = ? WHERE id = ?",
+                           (secreto, paso, user["id"]))
+                db.commit()
+                limpiar_intentos(clave)
+                _completar_login(user["username"])
+                return redirect(url_for("perfil"))
+            registrar_fallo(clave)
+            error = "Código incorrecto. Revisa que tu app tenga la hora automática."
+
+    grupos = " ".join(secreto[i:i + 4] for i in range(0, len(secreto), 4))
+    uri = f"otpauth://totp/ChiikawaGamingClub:{user['username']}?secret={secreto}&issuer=ChiikawaGamingClub"
+    form = f"""
+    <div class="card butter">
+      <h2>Activa la verificación en dos pasos</h2>
+      <p>1. En tu app autenticadora (Google Authenticator, Microsoft Authenticator, Authy…)
+         agrega una cuenta con <b>clave manual</b>, tipo <b>basado en tiempo</b>:</p>
+      <p><code>{escape(grupos)}</code></p>
+      <p class="hint">O abre este enlace si tu dispositivo lo admite: <a href="{escape(uri)}">agregar cuenta</a></p>
+      <p>2. Escribe el código de 6 dígitos que muestra la app para confirmar:</p>
+      <form method="post">
+        {csrf_field()}
+        <label for="codigo">Código</label>
+        <input type="text" id="codigo" name="codigo" inputmode="numeric" pattern="[0-9 ]{{6,7}}"
+               maxlength="7" autocomplete="one-time-code" required>
+        <button type="submit">Activar y entrar</button>
+      </form>
+      {f"<p class='error'>⚠️ {escape(error)}</p>" if error else ""}
+    </div>
+    """
+    return page(form)
+
+
+# === PUNTO DE ENTRADA 2: MURO DE MENSAJES (XSS corregido: se escapa al mostrar) ===
+@app.route("/muro", methods=["GET", "POST"])
+@login_required
+def muro():
+    db = get_db()
+    yo = db.execute(
+        "SELECT club FROM jugadores WHERE username = ?", (session["username"],)
+    ).fetchone()
+    club_actual = yo["club"] if yo and yo["club"] in CLUBES else None
+
+    club_elegido = club_actual
+    error = None
+    if request.method == "POST":
+        # Sanitización: se quitan caracteres de control; luego se valida largo y que no esté vacío.
+        contenido = limpiar_texto(request.form.get("contenido", ""))
+        # El equipo del mensaje solo puede ser uno de la lista de clubes (lista blanca).
+        pedido = request.form.get("club", "")
+        club_msg = pedido if pedido in CLUBES else club_actual
+        club_elegido = club_msg
+        if not contenido:
+            error = "Escribe un mensaje antes de publicar."
+        elif len(contenido) > MAX_MENSAJE:
+            error = f"El mensaje es muy largo (máximo {MAX_MENSAJE} caracteres)."
+        else:
+            db.execute(
+                "INSERT INTO mensajes (autor, contenido, club) VALUES (?, ?, ?)",
+                (session["username"], contenido, club_msg),
+            )
+            db.commit()
 
     mensajes = db.execute(
-        "SELECT autor, contenido FROM mensajes ORDER BY id DESC"
+        "SELECT autor, contenido, club FROM mensajes ORDER BY id DESC"
     ).fetchall()
 
-    # --- VULNERABILIDAD: el contenido se inserta tal cual en el HTML, sin escapar ---
-    lista_html = "".join(
-        f"<div class='msg-card n{AVATARES.index(avatar_key(m['autor']))}'>"
-        f"{avatar(avatar_key(m['autor']))}"
-        f"<div class='msg-body'><b>{m['autor']}</b>: {m['contenido']}</div></div>"
-        for m in mensajes
-    )
-    # --------------------------------------------------------------------------
+    def tarjeta_mensaje(m):
+        info = CLUBES.get(m["club"])
+        if info:  # el equipo con el que se publicó el mensaje
+            av = info["av"]
+            color = list(CLUBES).index(m["club"])
+            etiqueta = f" <span class='chip'>{escape(m['club'])}</span>"
+        else:     # mensajes antiguos o sin equipo
+            av = avatar_key(m["autor"])
+            color = AVATARES.index(av)
+            etiqueta = ""
+        # XSS: TODO dato que viene de la base de datos se escapa antes de entrar al HTML.
+        return (
+            f"<div class='msg-card n{color}'>"
+            f"{avatar(av)}"
+            f"<div class='msg-body'><b>{escape(m['autor'])}</b>{etiqueta}: {escape(m['contenido'])}</div></div>"
+        )
+
+    lista_html = "".join(tarjeta_mensaje(m) for m in mensajes)
     if mensajes:
         lista_html = f"<div class='notes'>{lista_html}</div>"
     else:
@@ -868,27 +1249,36 @@ def muro():
             "</div>"
         )
 
+    opciones = "".join(
+        f'<option value="{escape(nombre)}"{" selected" if nombre == club_elegido else ""}>{escape(nombre)}</option>'
+        for nombre in CLUBES
+    )
+    av_composer = CLUBES[club_elegido]["av"] if club_elegido else avatar_key(session["username"])
+
     form = f"""
     <div class="card composer">
-      {avatar(avatar_key(session["username"]), "big")}
+      {avatar(av_composer, "big")}
       <form method="post">
+        {csrf_field()}
         <h2>Muro del club</h2>
+        <label for="club">Publicar como</label>
+        <select id="club" name="club">{opciones}</select>
         <label for="contenido">Tu mensaje</label>
-        <input type="text" id="contenido" name="contenido" placeholder="Escribe algo para tu club...">
+        <input type="text" id="contenido" name="contenido" placeholder="Escribe algo para tu club..." required maxlength="{MAX_MENSAJE}">
         <button type="submit">Publicar</button>
+        {f"<p class='error'>⚠️ {escape(error)}</p>" if error else ""}
       </form>
     </div>
     {trivia_box("Mientras lees el muro", "mini lav", 3)}
     {lista_html}
     """
-    return BASE.format(content=form)
+    return page(form)
 
 
-# === PUNTO DE ENTRADA 3: UNIRSE A UN CLUB (vulnerable a CSRF) ===
+# === PUNTO DE ENTRADA 3: UNIRSE A UN CLUB (CSRF corregido: token + lista blanca) ===
 @app.route("/perfil")
+@login_required
 def perfil():
-    if "username" not in session:
-        return redirect(url_for("login"))
     db = get_db()
     user = db.execute(
         "SELECT * FROM jugadores WHERE username = ?", (session["username"],)
@@ -901,12 +1291,12 @@ def perfil():
         requerido = "required" if i == 0 else ""
         tiles += f"""
         <label class="tile">
-          <input type="radio" name="club" value="{nombre_club}" {marcado} {requerido}>
+          <input type="radio" name="club" value="{escape(nombre_club)}" {marcado} {requerido}>
           <span class="tile-body">
             {avatar(info["av"])}
             <span class="tile-text">
-              <b>{nombre_club}</b>
-              <small>{info["lema"]}</small>
+              <b>{escape(nombre_club)}</b>
+              <small>{escape(info["lema"])}</small>
             </span>
           </span>
         </label>
@@ -917,8 +1307,8 @@ def perfil():
         curiosidad = f"""
         <section class="card sky">
           <h2>Curiosidad de tu club</h2>
-          <p class="chip">{user['club']}</p>
-          <p>{info_club['dato']}</p>
+          <p class="chip">{escape(user['club'])}</p>
+          <p>{escape(info_club['dato'])}</p>
         </section>
         """
     else:
@@ -928,14 +1318,15 @@ def perfil():
     <section class="card carnet butter">
       {avatar(avatar_key(user['username']), "big")}
       <div>
-        <h2>Hola, {user['username']}</h2>
-        <p>Tu club actual: <span class="badge">{user['club']}</span></p>
+        <h2>Hola, {escape(user['username'])}</h2>
+        <p>Tu club actual: <span class="badge">{escape(user['club'])}</span></p>
       </div>
     </section>
 
     <section class="card">
       <h2>Cambiar de club</h2>
       <form method="post" action="{url_for('unirse_club')}">
+        {csrf_field()}
         <div class="tiles">{tiles}</div>
         <button type="submit">Unirme</button>
       </form>
@@ -943,35 +1334,38 @@ def perfil():
 
     {curiosidad}
     """
-    return BASE.format(content=content)
+    return page(content)
 
 
 @app.route("/unirse-club", methods=["POST"])
+@login_required
 def unirse_club():
-    if "username" not in session:
-        return redirect(url_for("login"))
-
-    # --- VULNERABILIDAD: cambia el estado del jugador solo con la cookie de sesión,
-    #     sin validar ningún token CSRF. Un sitio externo podría enviar este
-    #     mismo POST "en nombre" del usuario si este tiene la sesión abierta. ---
-    nuevo_club = request.form.get("club", "Sin club")
+    # El token CSRF ya se validó en before_request. Aquí se valida el DATO: solo clubes conocidos.
+    nuevo_club = request.form.get("club", "")
+    if nuevo_club not in CLUBES:
+        abort(400, "Club no válido.")
     db = get_db()
     db.execute(
         "UPDATE jugadores SET club = ? WHERE username = ?",
         (nuevo_club, session["username"]),
     )
     db.commit()
-    # --------------------------------------------------------------------------
-
     return redirect(url_for("perfil"))
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])  # POST + token: un sitio externo no puede cerrar tu sesión
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--totp":
+        # Utilidad de demostración: genera el código actual de un secreto (como lo haría la app móvil).
+        print(totp(sys.argv[2].replace(" ", "")))
+        sys.exit(0)
     init_db()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # debug=True expone la consola interactiva de Werkzeug (ejecución remota de código):
+    # solo se activa si se pide explícitamente con FLASK_DEBUG=1.
+    app.run(host="127.0.0.1", port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")
