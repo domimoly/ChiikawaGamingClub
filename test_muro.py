@@ -5,22 +5,8 @@ Cada prueba usa una base SQLite temporal; no toca chiikawa.db.
 """
 import sqlite3
 
-import pytest
-
 import app as chiikawa
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(chiikawa, "DB_PATH", str(tmp_path / "test.db"))
-    chiikawa.init_db()
-    chiikawa.app.config["TESTING"] = True
-    with chiikawa.app.test_client() as c:
-        yield c
-
-
-def login(client, user="chiikawa", pwd="sakura123"):
-    return client.post("/login", data={"username": user, "password": pwd})
+from conftest import login, post  # client y _reiniciar_bloqueo_de_intentos vienen de conftest.py
 
 
 def ultimo_mensaje():
@@ -51,13 +37,13 @@ def test_selector_parte_en_el_club_actual_del_jugador(client):
 
 def test_mensaje_se_guarda_con_el_equipo_elegido(client):
     login(client)
-    client.post("/muro", data={"contenido": "hola", "club": "Equipo Momonga"})
+    post(client, "/muro", contenido="hola", club="Equipo Momonga")
     assert ultimo_mensaje() == ("chiikawa", "hola", "Equipo Momonga")
 
 
 def test_mensaje_muestra_chip_y_avatar_del_equipo(client):
     login(client)
-    client.post("/muro", data={"contenido": "hola", "club": "Equipo Kurimanju"})
+    post(client, "/muro", contenido="hola", club="Equipo Kurimanju")
     html = client.get("/muro").get_data(as_text=True)
     assert "<span class='chip'>Equipo Kurimanju</span>" in html
     assert 'href="#a-kuri"' in html
@@ -65,33 +51,33 @@ def test_mensaje_muestra_chip_y_avatar_del_equipo(client):
 
 def test_ya_no_salen_todos_los_mensajes_con_el_mismo_equipo(client):
     login(client)
-    client.post("/muro", data={"contenido": "uno", "club": "Equipo Usagi"})
-    client.post("/muro", data={"contenido": "dos", "club": "Equipo Momonga"})
+    post(client, "/muro", contenido="uno", club="Equipo Usagi")
+    post(client, "/muro", contenido="dos", club="Equipo Momonga")
     html = client.get("/muro").get_data(as_text=True)
     assert "Equipo Usagi</span>" in html and "Equipo Momonga</span>" in html
 
 
 def test_club_invalido_cae_al_club_actual(client):
     login(client)
-    client.post("/muro", data={"contenido": "hola", "club": "Equipo Inventado"})
+    post(client, "/muro", contenido="hola", club="Equipo Inventado")
     assert ultimo_mensaje()[2] == "Equipo Usagi"
 
 
 def test_sin_campo_club_usa_el_club_actual(client):
     login(client, "hachiware", "estrella99")  # Equipo Momonga
-    client.post("/muro", data={"contenido": "hola"})
+    post(client, "/muro", contenido="hola")
     assert ultimo_mensaje()[2] == "Equipo Momonga"
 
 
 def test_mensaje_vacio_no_se_guarda(client):
     login(client)
-    client.post("/muro", data={"contenido": "   ", "club": "Equipo Usagi"})
+    post(client, "/muro", contenido="   ", club="Equipo Usagi")
     assert ultimo_mensaje() is None
 
 
 def test_nombre_de_club_no_se_inyecta_como_html(client):
     login(client)
-    client.post("/muro", data={"contenido": "x", "club": "<b>x</b>"})
+    post(client, "/muro", contenido="x", club="<b>x</b>")
     html = client.get("/muro").get_data(as_text=True)
     assert "<b>x</b></span>" not in html
 
