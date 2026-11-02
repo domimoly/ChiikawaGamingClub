@@ -1,4 +1,4 @@
-# Chiikawa Gaming Club 🐾
+# 🎮 Chiikawa Gaming Club 🐾
 
 Mini aplicación web en **Flask** creada para la **Evaluación Parcial 2 de Ciberseguridad (EA 2 · OCY1102) | Dominga Ruiz**.
 
@@ -7,8 +7,7 @@ vulnerabilidades intencionales** (SQL Injection, XSS almacenado, CSRF y ausencia
 **analizadas, corregidas y verificadas con pruebas de penetración**; el detalle completo está en el
 [Informe de seguridad](INFORME_SEGURIDAD.md).
 
-> ⚠️ **Uso exclusivamente educativo.** Ejecútala solo en tu computador, en `localhost`. No la publiques en Internet
-> ni en una red compartida (ver [Limitaciones conocidas](#limitaciones-conocidas)).
+> ⚠️ **Uso exclusivamente educativo.** Ejecútala solo en tu computador, en `localhost`.
 
 ---
 
