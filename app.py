@@ -14,7 +14,7 @@ Puntos de entrada de datos (3), cada uno con una falla distinta:
 
 Además, la autenticación NO tiene segundo factor (falta IL 2.3 / MFA).
 
-ESTADO ACTUAL: todas las fallas anteriores fueron corregidas:
+ESTADO ACTUAL: todas las fallas anteriores fueron corregidas (ver INFORME_SEGURIDAD.md):
   1. /login          -> consulta parametrizada + validación de formato + contraseñas con hash
                         + bloqueo temporal por intentos fallidos
   2. /muro           -> salida escapada (XSS) + validación de largo/caracteres + token CSRF
@@ -1364,6 +1364,20 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--totp":
         # Utilidad de demostración: genera el código actual de un secreto (como lo haría la app móvil).
         print(totp(sys.argv[2].replace(" ", "")))
+        sys.exit(0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--codigo":
+        # Utilidad de demostración: código actual de un jugador YA enrolado (lee su secreto de la BD).
+        init_db()  # migra una base antigua (sin columnas de MFA) antes de consultarla
+        fila = sqlite3.connect(DB_PATH).execute(
+            "SELECT totp_secret, totp_ultimo FROM jugadores WHERE username = ?", (sys.argv[2],)
+        ).fetchone()
+        if fila is None:
+            sys.exit(f"No existe el jugador '{sys.argv[2]}'.")
+        if not fila[0]:
+            sys.exit("Ese jugador aún no activó el MFA: usa la clave que muestra la pantalla con --totp.")
+        actual = int(time.time() // 30)
+        # Primer paso que el servidor aceptaría (mayor al último usado, dentro de la tolerancia de +1).
+        print(totp(fila[0], next(p for p in (actual, actual + 1) if p > fila[1])))
         sys.exit(0)
     init_db()
     # debug=True expone la consola interactiva de Werkzeug (ejecución remota de código):
